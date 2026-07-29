@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -295,4 +296,48 @@ func TestSanitizeOverFlowingChildren_MultipleChildren(t *testing.T) {
 	assert.False(t, ok3)
 	_, ok4 := result[[8]byte{4}]
 	assert.False(t, ok4)
+}
+
+func TestSanitizeOverFlowingChildren_RecursiveTruncation(t *testing.T) {
+	// chain: GP (100-200) -> Parent (120-250) -> Child (220-240)
+	// GP should truncate Parent to 120-200.
+	// Since Parent is truncated to 120-200, Child (220-240) now falls completely outside Parent's range and should be dropped.
+	input := map[pcommon.SpanID]CPSpan{
+		[8]byte{1}: {
+			SpanID:       [8]byte{1},
+			StartTime:    100,
+			Duration:     100, // 100-200
+			ChildSpanIDs: []pcommon.SpanID{[8]byte{2}},
+		},
+		[8]byte{2}: {
+			SpanID:       [8]byte{2},
+			ParentSpanID: [8]byte{1},
+			StartTime:    120,
+			Duration:     130, // 120-250 (ends after GP)
+			ChildSpanIDs: []pcommon.SpanID{[8]byte{3}},
+		},
+		[8]byte{3}: {
+			SpanID:       [8]byte{3},
+			ParentSpanID: [8]byte{2},
+			StartTime:    220,
+			Duration:     20, // 220-240 (ends before Parent's original end, but after truncated Parent end)
+		},
+	}
+
+	result := removeOverflowingChildren(input)
+
+	// GP should still exist
+	_, ok1 := result[[8]byte{1}]
+	assert.True(t, ok1)
+
+	// Parent should be truncated to 120-200 (duration 80)
+	parent, ok2 := result[[8]byte{2}]
+	require.True(t, ok2)
+	assert.Equal(t, uint64(120), parent.StartTime)
+	assert.Equal(t, uint64(80), parent.Duration)
+
+	// Child should be dropped because it starts at 220, which is after Parent's truncated end time (200)
+	_, ok3 := result[[8]byte{3}]
+	assert.False(t, ok3, "Child should be dropped because it is outside truncated Parent's bounds")
+	assert.Empty(t, parent.ChildSpanIDs, "Parent's ChildSpanIDs should be empty after Child is dropped")
 }

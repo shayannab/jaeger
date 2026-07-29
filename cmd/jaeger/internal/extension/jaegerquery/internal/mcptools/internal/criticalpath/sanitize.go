@@ -12,93 +12,111 @@ import (
 // The function adjusts the start time and duration of overflowing child spans
 // to ensure they fit within the time range of their parent span.
 func removeOverflowingChildren(spanMap map[pcommon.SpanID]CPSpan) map[pcommon.SpanID]CPSpan {
-	// Get all span IDs
-	spanIDs := make([]pcommon.SpanID, 0, len(spanMap))
-	for spanID := range spanMap {
-		spanIDs = append(spanIDs, spanID)
+	// First pass: drop all spans whose parent is not empty and missing from map,
+	// along with all their descendants.
+	var orphans []pcommon.SpanID
+	for spanID, span := range spanMap {
+		if !span.ParentSpanID.IsEmpty() {
+			if _, parentExists := spanMap[span.ParentSpanID]; !parentExists {
+				orphans = append(orphans, spanID)
+			}
+		}
 	}
 
-	for _, spanID := range spanIDs {
-		span, ok := spanMap[spanID]
-		if !ok || span.ParentSpanID.IsEmpty() {
-			continue
+	for _, orphanID := range orphans {
+		if span, exists := spanMap[orphanID]; exists {
+			delete(spanMap, orphanID)
+			dropDescendants(spanMap, span)
 		}
+	}
 
-		// parentSpan will be undefined when its parent was dropped previously
-		parentSpan, parentExists := spanMap[span.ParentSpanID]
-		if !parentExists {
-			// Drop the child spans of dropped parent span
-			delete(spanMap, span.SpanID)
-			continue
+	// Second pass: find real roots (ParentSpanID is empty) and sanitize top-down.
+	var roots []pcommon.SpanID
+	for spanID, span := range spanMap {
+		if span.ParentSpanID.IsEmpty() {
+			roots = append(roots, spanID)
 		}
+	}
 
-		childEndTime := span.StartTime + span.Duration
-		parentEndTime := parentSpan.StartTime + parentSpan.Duration
-
-		if span.StartTime >= parentSpan.StartTime {
-			if span.StartTime >= parentEndTime {
-				// child outside of parent range => drop the child span
-				//      |----parent----|
-				//                        |----child--|
-				delete(spanMap, span.SpanID)
-
-				// Remove the childSpanId from its parent span
-				filteredChildren := make([]pcommon.SpanID, 0, len(parentSpan.ChildSpanIDs))
-				for _, childID := range parentSpan.ChildSpanIDs {
-					if childID != span.SpanID {
-						filteredChildren = append(filteredChildren, childID)
-					}
-				}
-				parentSpan.ChildSpanIDs = filteredChildren
-				spanMap[parentSpan.SpanID] = parentSpan
-				continue
-			}
-			if childEndTime > parentEndTime {
-				// child end after parent, truncate is needed
-				//      |----parent----|
-				//              |----child--|
-				span.Duration = parentEndTime - span.StartTime
-				spanMap[span.SpanID] = span
-				continue
-			}
-			// everything looks good
-			// |----parent----|
-			//   |----child--|
-			continue
-		}
-
-		switch {
-		case childEndTime <= parentSpan.StartTime:
-			// child outside of parent range => drop the child span
-			//                      |----parent----|
-			//       |----child--|
-			delete(spanMap, span.SpanID)
-
-			// Remove the childSpanId from its parent span
-			filteredChildren := make([]pcommon.SpanID, 0, len(parentSpan.ChildSpanIDs))
-			for _, childID := range parentSpan.ChildSpanIDs {
-				if childID != span.SpanID {
-					filteredChildren = append(filteredChildren, childID)
-				}
-			}
-			parentSpan.ChildSpanIDs = filteredChildren
-			spanMap[parentSpan.SpanID] = parentSpan
-		case childEndTime <= parentEndTime:
-			// child start before parent, truncate is needed
-			//      |----parent----|
-			//   |----child--|
-			span.StartTime = parentSpan.StartTime
-			span.Duration = childEndTime - parentSpan.StartTime
-			spanMap[span.SpanID] = span
-		default:
-			// child start before parent and end after parent, truncate is needed
-			//      |----parent----|
-			//  |---------child---------|
-			span.StartTime = parentSpan.StartTime
-			span.Duration = parentEndTime - parentSpan.StartTime
-			spanMap[span.SpanID] = span
-		}
+	for _, rootID := range roots {
+		sanitizeSpan(spanMap, rootID)
 	}
 
 	return spanMap
+}
+
+func sanitizeSpan(spanMap map[pcommon.SpanID]CPSpan, spanID pcommon.SpanID) {
+	span, ok := spanMap[spanID]
+	if !ok {
+		return
+	}
+
+	filteredChildren := make([]pcommon.SpanID, 0, len(span.ChildSpanIDs))
+	for _, childID := range span.ChildSpanIDs {
+		child, childExists := spanMap[childID]
+		if !childExists {
+			continue
+		}
+
+		keepChild := true
+		childEndTime := child.StartTime + child.Duration
+		parentEndTime := span.StartTime + span.Duration
+
+		if child.StartTime >= span.StartTime {
+			if child.StartTime >= parentEndTime {
+				// child starts at or after parent ends => drop the child span
+				//      |----parent----|
+				//                        |----child--|
+				keepChild = false
+			} else if childEndTime > parentEndTime {
+				// child ends after parent => truncate duration to fit parent
+				//      |----parent----|
+				//              |----child--|
+				child.Duration = parentEndTime - child.StartTime
+			}
+		} else {
+			// child starts before parent
+			if childEndTime <= span.StartTime {
+				// child ends at or before parent starts => drop the child span
+				//                      |----parent----|
+				//       |----child--|
+				keepChild = false
+			} else if childEndTime <= parentEndTime {
+				// child starts before parent, ends before/at parent end => truncate start
+				//      |----parent----|
+				//   |----child--|
+				child.StartTime = span.StartTime
+				child.Duration = childEndTime - span.StartTime
+			} else {
+				// child starts before parent and ends after parent => truncate both
+				//      |----parent----|
+				//  |---------child---------|
+				child.StartTime = span.StartTime
+				child.Duration = parentEndTime - span.StartTime
+			}
+		}
+
+		if keepChild {
+			spanMap[childID] = child
+			filteredChildren = append(filteredChildren, childID)
+			// Recursively sanitize child's subtree
+			sanitizeSpan(spanMap, childID)
+		} else {
+			// Drop child span and all its descendants recursively
+			delete(spanMap, childID)
+			dropDescendants(spanMap, child)
+		}
+	}
+
+	span.ChildSpanIDs = filteredChildren
+	spanMap[spanID] = span
+}
+
+func dropDescendants(spanMap map[pcommon.SpanID]CPSpan, span CPSpan) {
+	for _, childID := range span.ChildSpanIDs {
+		if child, exists := spanMap[childID]; exists {
+			delete(spanMap, childID)
+			dropDescendants(spanMap, child)
+		}
+	}
 }
