@@ -5,6 +5,7 @@ package grpc
 
 import (
 	"context"
+	"errors"
 	"math"
 	"net"
 	"testing"
@@ -232,7 +233,7 @@ func TestFactory_Timeout(t *testing.T) {
 	require.NoError(t, err)
 
 	s := grpc.NewServer()
-	srv := &sleepServer{sleepDuration: 200 * time.Millisecond}
+	srv := &sleepServer{sleepDuration: 500 * time.Millisecond}
 	storage.RegisterTraceReaderServer(s, srv)
 
 	go func() {
@@ -248,7 +249,7 @@ func TestFactory_Timeout(t *testing.T) {
 			},
 		},
 		TimeoutConfig: exporterhelper.TimeoutConfig{
-			Timeout: 20 * time.Millisecond,
+			Timeout: 100 * time.Millisecond,
 		},
 	}
 
@@ -276,5 +277,67 @@ func TestFactory_Timeout(t *testing.T) {
 		_, err := jiter.FlattenWithErrors(it)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), context.DeadlineExceeded.Error())
+	})
+}
+
+type mockClientStream struct {
+	grpc.ClientStream
+	recvErr error
+	sendErr error
+}
+
+func (m *mockClientStream) RecvMsg(msg any) error {
+	return m.recvErr
+}
+
+func (m *mockClientStream) SendMsg(msg any) error {
+	return m.sendErr
+}
+
+func TestTimeoutStreamClientInterceptor_ErrorBranches(t *testing.T) {
+	interceptor := timeoutStreamClientInterceptor(time.Second)
+
+	t.Run("streamer error calls cancel", func(t *testing.T) {
+		expectedErr := errors.New("streamer error")
+		streamer := func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			return nil, expectedErr
+		}
+		stream, err := interceptor(context.Background(), &grpc.StreamDesc{}, nil, "/test.Service/Method", streamer)
+		assert.Nil(t, stream)
+		assert.ErrorIs(t, err, expectedErr)
+	})
+
+	t.Run("RecvMsg error cancels context", func(t *testing.T) {
+		expectedErr := errors.New("recv error")
+		mStream := &mockClientStream{recvErr: expectedErr}
+		var capturedCtx context.Context
+		streamer := func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			capturedCtx = ctx
+			return mStream, nil
+		}
+		stream, err := interceptor(context.Background(), &grpc.StreamDesc{}, nil, "/test.Service/Method", streamer)
+		require.NoError(t, err)
+		require.NotNil(t, stream)
+
+		err = stream.RecvMsg(nil)
+		assert.ErrorIs(t, err, expectedErr)
+		assert.ErrorIs(t, capturedCtx.Err(), context.Canceled)
+	})
+
+	t.Run("SendMsg error cancels context", func(t *testing.T) {
+		expectedErr := errors.New("send error")
+		mStream := &mockClientStream{sendErr: expectedErr}
+		var capturedCtx context.Context
+		streamer := func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			capturedCtx = ctx
+			return mStream, nil
+		}
+		stream, err := interceptor(context.Background(), &grpc.StreamDesc{}, nil, "/test.Service/Method", streamer)
+		require.NoError(t, err)
+		require.NotNil(t, stream)
+
+		err = stream.SendMsg(nil)
+		assert.ErrorIs(t, err, expectedErr)
+		assert.ErrorIs(t, capturedCtx.Err(), context.Canceled)
 	})
 }
